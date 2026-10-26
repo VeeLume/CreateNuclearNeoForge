@@ -55,6 +55,13 @@ public class RadiationCapability {
     private double contagionDose;
     private int contagionTicks;
 
+    // Not saved or synced: the biome under the entity, looked up again only when it moves
+    // to another block, or after BIOME_RECHECK_TICKS in case the biome changed in place.
+    private long biomeBlockPos = Long.MIN_VALUE;
+    private int biomeCheckedAt;
+    private ResourceKey<Biome> biomeKey;
+    private static final int BIOME_RECHECK_TICKS = 100;
+
     public double getRadiation() { return this.radiation; }
     public void setRadiation(double value) { this.radiation = value; }
 
@@ -104,18 +111,21 @@ public class RadiationCapability {
 
         RadiationCapability cap = entity.getData(CNAttachmentTypes.RADIATION);
 
+        double radiationBefore = cap.getRadiation();
+        ResourceLocation biomeBefore = cap.getLastBiomeLocation();
+        int contagionBefore = cap.getContagionTicks();
+
         if (entity instanceof Player player) {
             long newHash = InventoryHashUtil.compute(player);
             if (newHash != cap.getInventoryHash()) {
                 cap.setInventoryHash(newHash);
                 cap.setRadiation(Math.max(0, computeItemRadiation(player)));
             }
-            player.syncData(CNAttachmentTypes.RADIATION);
         } else {
             cap.setRadiation(Math.max(0, computeItemRadiation(entity)));
         }
 
-        ResourceKey<Biome> biomeKey = level.getBiome(entity.blockPosition()).unwrapKey().orElse(null);
+        ResourceKey<Biome> biomeKey = cap.biomeAt(entity);
         ResourceLocation biomeLoc = biomeKey != null ? biomeKey.location() : null;
         if (!Objects.equals(biomeLoc, cap.getLastBiomeLocation())) {
             cap.setLastBiomeLocation(biomeLoc);
@@ -132,6 +142,28 @@ public class RadiationCapability {
         double totalRadiation = totalRaw * (1.0 - resistance);
 
         applyEffects(entity, totalRadiation);
+
+        // The client only shows what it was sent; sending it every tick for every player
+        // cost more than the rest of the check. Send on change (same fields as
+        // STREAM_CODEC, minus the inventory hash, which only matters on the server), and
+        // once a second regardless, so a client that missed one catches up.
+        if (entity instanceof Player player
+                && (player.tickCount % 20 == 0
+                    || cap.getRadiation() != radiationBefore
+                    || !Objects.equals(cap.getLastBiomeLocation(), biomeBefore)
+                    || cap.getContagionTicks() != contagionBefore)) {
+            player.syncData(CNAttachmentTypes.RADIATION);
+        }
+    }
+
+    private ResourceKey<Biome> biomeAt(LivingEntity entity) {
+        long pos = entity.blockPosition().asLong();
+        if (pos != biomeBlockPos || entity.tickCount - biomeCheckedAt >= BIOME_RECHECK_TICKS || entity.tickCount < biomeCheckedAt) {
+            biomeKey = entity.level().getBiome(entity.blockPosition()).unwrapKey().orElse(null);
+            biomeBlockPos = pos;
+            biomeCheckedAt = entity.tickCount;
+        }
+        return biomeKey;
     }
 
     private static double computeItemRadiation(Player player) {
@@ -199,7 +231,8 @@ public class RadiationCapability {
 
     private static void applyEffects(LivingEntity entity, double radiation) {
         if (radiation <= 0) {
-            entity.removeEffect(CNEffects.RADIATION);
+            // removeEffect posts MobEffectEvent.Remove even when there is nothing to remove.
+            if (entity.hasEffect(CNEffects.RADIATION)) entity.removeEffect(CNEffects.RADIATION);
             return;
         }
 
